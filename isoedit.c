@@ -905,11 +905,19 @@ static int DWSIGNAL prog_cancel_cb(HWND window, void *data)
     return TRUE;
 }
 
-static void progress_window_create(const char *title)
+/*
+ * The progress window is created once and reused (shown/hidden), never
+ * destroyed while the main loop runs. On GTK, dw_percent_set_pos() with
+ * DW_PERCENT_INDETERMINATE starts a 100 ms g_timeout that holds a raw
+ * pointer to the progress bar and takes no reference on it. Destroying
+ * the window while that timeout is pending makes the next tick touch a
+ * freed GObject, which crashed the app right after an image was opened.
+ */
+static void progress_window_create(void)
 {
     HWND vbox, hbox, cancel;
 
-    g_progwin = dw_window_new(HWND_DESKTOP, title, DW_FCF_TITLEBAR | DW_FCF_DLGBORDER);
+    g_progwin = dw_window_new(HWND_DESKTOP, APP_NAME, DW_FCF_TITLEBAR | DW_FCF_DLGBORDER);
     vbox = dw_box_new(DW_VERT, 8);
     dw_box_pack_start(g_progwin, vbox, 0, 0, TRUE, TRUE, 0);
     g_progtext = dw_text_new("Starting...", 0);
@@ -925,7 +933,7 @@ static void progress_window_create(const char *title)
     dw_signal_connect(g_progwin, DW_SIGNAL_DELETE, DW_SIGNAL_FUNC(prog_cancel_cb), NULL);
     dw_window_set_gravity(g_progwin, DW_GRAV_CENTER, DW_GRAV_CENTER);
     dw_window_set_pos_size(g_progwin, 0, 0, 440, 140);
-    dw_window_show(g_progwin);
+    /* Created hidden; job_start() shows it, job_finish() hides it */
 }
 
 static void job_free(Job *j)
@@ -941,8 +949,10 @@ static void job_finish(void)
     Job *j = g_job;
     int cancelled = g_cancel;
 
-    dw_window_destroy(g_progwin);
-    g_progwin = g_progbar = g_progtext = 0;
+    /* Leave indeterminate mode (clears the pulse timer's "alive" flag so it
+     * stops on its next tick) and hide - do NOT destroy, see above. */
+    dw_percent_set_pos(g_progbar, 0);
+    dw_window_hide(g_progwin);
     g_job = NULL;
     dw_window_enable(g_mainwin);
 
@@ -1057,9 +1067,12 @@ static void job_start(int type, char **items, int count, char *target)
     g_job = j;
 
     dw_window_disable(g_mainwin);
-    progress_window_create(titles[type]);
+    dw_window_set_text(g_progwin, titles[type]);
+    dw_window_set_text(g_progtext, "Starting...");
+    dw_percent_set_pos(g_progbar, 0);
     if(type != JOB_SAVE)
         dw_percent_set_pos(g_progbar, DW_PERCENT_INDETERMINATE);
+    dw_window_show(g_progwin);
     g_jobtimer = dw_timer_connect(JOB_POLL_MS, DW_SIGNAL_FUNC(job_timer_cb), NULL);
     dw_thread_new(DW_SIGNAL_FUNC(job_thread), j, WORKER_STACK);
 }
@@ -1930,6 +1943,7 @@ int dwmain(int argc, char *argv[])
     g_fileicon = icon_load("file");
 
     mainwindow_create();
+    progress_window_create();
     local_refresh();
     iso_refresh();
 
@@ -1948,6 +1962,8 @@ int dwmain(int argc, char *argv[])
 
     dw_main();
 
+    /* Main loop has ended, so no pending GTK timeouts can fire any more */
+    dw_window_destroy(g_progwin);
     dw_window_destroy(g_mainwin);
     bk_destroy_vol_info(g_vol);
     free(g_vol);
