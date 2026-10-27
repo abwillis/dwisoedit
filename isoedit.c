@@ -17,8 +17,20 @@
  *   +-----------------------------------------------------------+
  *
  * Long operations (open, add, extract, save) run in a worker thread.
- * The worker never touches GUI handles; a DW timer on the GUI thread
- * polls the job state, updates the progress window and finishes the job.
+ *
+ * Threading model (GTK): every Dynamic Windows call made from a non-GUI
+ * thread takes the GDK lock internally (DW_MUTEX_LOCK), which is the
+ * supported way to update the GUI from a thread. The worker therefore
+ * updates the progress window and finishes the job itself (job_finish()).
+ *
+ * No DW timer is used. On GTK3, DW timer callbacks run on the GUI thread
+ * WITHOUT the GDK lock, so GUI work there is not serialized with GDK
+ * event dispatch; doing the job completion from a timer is what left
+ * the GDK lock held and froze the result dialog after a save.
+ *
+ * Nothing that runs on the worker may open a modal dialog
+ * (dw_messagebox(), dw_file_browse(), dw_dialog_wait()); results are
+ * shown in the pre-created, non-modal notice window instead.
  *
  * IMPORTANT: bkisofs is built with -D_FILE_OFFSET_BITS=64 and VolInfo
  * contains off_t members, so this file MUST be compiled with the same
@@ -48,7 +60,6 @@
 #define APP_VERSION     "1.0"
 #define FN_TYPES        (FNTYPE_9660 | FNTYPE_ROCKRIDGE | FNTYPE_JOLIET)
 #define WORKER_STACK    (256 * 1024)
-#define JOB_POLL_MS     150
 #define MSG_MAX         900
 
 /* ------------------------------------------------------------------ */
@@ -81,7 +92,6 @@ typedef struct
     int count;
     char *target;           /* image dir, local dir or filename */
     volatile int current;   /* index being processed            */
-    volatile int done;      /* set last by the worker           */
     int rc;                 /* last bkisofs return code         */
     int successes;
     int failures;
@@ -104,10 +114,10 @@ static HICN g_foldericon, g_fileicon;
 static char *g_context_text;        /* row under a context menu        */
 
 static Job *g_job;                  /* non-NULL while a job is running */
-static HTIMER g_jobtimer;
 static HWND g_progwin, g_progbar, g_progtext;
+static HWND g_notewin, g_notemle;   /* reusable non-modal notice window */
 static volatile int g_cancel;
-static volatile double g_percent;
+static int g_lastpct;               /* worker only: last % shown        */
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                      */
@@ -584,6 +594,8 @@ static void iso_refresh(void)
     update_status();
 }
 
+static void notice_show(const char *title, const char *fmt, ...);
+
 static void local_refresh(void)
 {
     DIR *d;
@@ -636,8 +648,8 @@ static void local_refresh(void)
         free((char *)e[i].name);
     free(e);
     dw_window_set_text(g_local.pathentry, g_localpath);
-    if(!d)
-        error_box("Unable to read folder:\n%s", g_localpath);
+    if(!d)  /* may run on the worker via job_finish(): no modal box */
+        notice_show(APP_NAME " - Error", "Unable to read folder:\n%s", g_localpath);
 }
 
 static void iso_chdir(const char *newpath)
@@ -828,12 +840,36 @@ static void progress_cb(VolInfo *vol)
         vol->stopOperation = true;
 }
 
+/* Worker thread: DW calls lock GDK internally */
+static void job_status(int percent, const char *fmt, ...)
+{
+    char buf[400];
+    va_list args;
+
+    if(g_cancel)
+        return;     /* keep "Cancelling..." visible */
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    dw_window_set_text(g_progtext, buf);
+    if(percent >= 0)
+        dw_percent_set_pos(g_progbar, (unsigned int)percent);
+}
+
 static void write_progress_cb(VolInfo *vol, double percent)
 {
-    g_percent = percent;
+    int pct = (int)percent;
+
     if(g_cancel)
         vol->stopOperation = true;
+    else if(pct != g_lastpct && g_job)
+    {
+        g_lastpct = pct;
+        job_status(pct, "Writing %s (%d%%)", base_name(g_job->target), pct);
+    }
 }
+
+static void job_finish(void);
 
 static void DWSIGNAL job_thread(void *data)
 {
@@ -867,6 +903,9 @@ static void DWSIGNAL job_thread(void *data)
                 rc = BKERROR_OPER_CANCELED_BY_USER;
                 break;
             }
+            job_status(i * 100 / j->count, "%s %d of %d: %s",
+                       j->type == JOB_ADD ? "Adding" : "Extracting",
+                       i + 1, j->count, base_name(j->items[i]));
             if(j->type == JOB_ADD)
                 rc = bk_add(g_vol, j->items[i], j->target, progress_cb);
             else
@@ -891,7 +930,7 @@ static void DWSIGNAL job_thread(void *data)
     }
 
     j->rc = rc;
-    j->done = 1;
+    job_finish();   /* still on the worker thread */
 }
 
 static int DWSIGNAL prog_cancel_cb(HWND window, void *data)
@@ -907,11 +946,10 @@ static int DWSIGNAL prog_cancel_cb(HWND window, void *data)
 
 /*
  * The progress window is created once and reused (shown/hidden), never
- * destroyed while the main loop runs. On GTK, dw_percent_set_pos() with
- * DW_PERCENT_INDETERMINATE starts a 100 ms g_timeout that holds a raw
- * pointer to the progress bar and takes no reference on it. Destroying
- * the window while that timeout is pending makes the next tick touch a
- * freed GObject, which crashed the app right after an image was opened.
+ * destroyed while the main loop runs. DW_PERCENT_INDETERMINATE is not
+ * used: on GTK it starts a lock-less 100 ms g_timeout holding a raw
+ * pointer to the progress bar (the cause of the earlier crash), and that
+ * timeout would also race with the worker's locked GUI updates.
  */
 static void progress_window_create(void)
 {
@@ -936,6 +974,59 @@ static void progress_window_create(void)
     /* Created hidden; job_start() shows it, job_finish() hides it */
 }
 
+/*
+ * Non-modal notice window, created once at startup on the GUI thread
+ * (window sizing on GTK/X11 may run a short nested event loop, which is
+ * only safe there) and then just filled and shown/hidden. Safe to call
+ * from the worker thread and from GUI signal handlers.
+ */
+static int DWSIGNAL notice_close_cb(HWND window, void *data)
+{
+    dw_window_hide(g_notewin);
+    return TRUE;    /* DELETE: handled, keep the window for reuse */
+}
+
+static void notice_create(void)
+{
+    HWND vbox, hbox, ok;
+
+    g_notewin = dw_window_new(HWND_DESKTOP, APP_NAME,
+                              DW_FCF_TITLEBAR | DW_FCF_SYSMENU | DW_FCF_DLGBORDER | DW_FCF_SIZEBORDER);
+    vbox = dw_box_new(DW_VERT, 6);
+    dw_box_pack_start(g_notewin, vbox, 0, 0, TRUE, TRUE, 0);
+    g_notemle = dw_mle_new(0);
+    dw_box_pack_start(vbox, g_notemle, 420, 110, TRUE, TRUE, 2);
+    dw_mle_set_editable(g_notemle, FALSE);
+    dw_mle_set_word_wrap(g_notemle, TRUE);
+    hbox = dw_box_new(DW_HORZ, 0);
+    dw_box_pack_start(vbox, hbox, 0, 0, TRUE, FALSE, 0);
+    dw_box_pack_start(hbox, 0, 1, 1, TRUE, FALSE, 0);
+    ok = dw_button_new("OK", 0);
+    dw_box_pack_start(hbox, ok, 90, DW_SIZE_AUTO, FALSE, FALSE, 2);
+    dw_signal_connect(ok, DW_SIGNAL_CLICKED, DW_SIGNAL_FUNC(notice_close_cb), NULL);
+    dw_signal_connect(g_notewin, DW_SIGNAL_DELETE, DW_SIGNAL_FUNC(notice_close_cb), NULL);
+    dw_window_default(g_notewin, ok);
+    dw_window_set_gravity(g_notewin, DW_GRAV_CENTER, DW_GRAV_CENTER);
+    dw_window_set_pos_size(g_notewin, 0, 0, 460, 190);
+    /* Created hidden; notice_show() fills and shows it */
+}
+
+static void notice_show(const char *title, const char *fmt, ...)
+{
+    char buf[MSG_MAX * 2 + 1];
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    dw_window_set_text(g_notewin, title);
+    dw_mle_clear(g_notemle);
+    dw_mle_import(g_notemle, buf, -1);
+    dw_mle_set_cursor(g_notemle, 0);
+    dw_window_show(g_notewin);
+}
+
 static void job_free(Job *j)
 {
     free_list(j->items, j->count);
@@ -944,17 +1035,19 @@ static void job_free(Job *j)
     free(j);
 }
 
+/*
+ * Runs on the WORKER thread at the end of job_thread(). The main window
+ * stays disabled and g_job stays set until the very end, so no GUI
+ * handler can touch g_vol or the panes while this runs.
+ */
 static void job_finish(void)
 {
     Job *j = g_job;
     int cancelled = g_cancel;
+    char msg[MSG_MAX * 2 + 1] = "";
+    const char *title = APP_NAME;
 
-    /* Leave indeterminate mode (clears the pulse timer's "alive" flag so it
-     * stops on its next tick) and hide - do NOT destroy, see above. */
-    dw_percent_set_pos(g_progbar, 0);
     dw_window_hide(g_progwin);
-    g_job = NULL;
-    dw_window_enable(g_mainwin);
 
     switch(j->type)
     {
@@ -970,7 +1063,11 @@ static void job_finish(void)
             set_string(&g_isofile, NULL);
             g_modified = 0;
             if(!cancelled)
-                bk_error("Opening", j->target, j->rc);
+            {
+                title = APP_NAME " - Error";
+                snprintf(msg, sizeof(msg), "Opening %s failed:\n%s",
+                         j->target, bk_get_error_string(j->rc));
+            }
         }
         set_string(&g_isopath, "/");
         iso_refresh();
@@ -991,63 +1088,34 @@ static void job_finish(void)
         {
             g_modified = 0;
             update_status();
-            info_box("Image written to:\n%s", j->target);
+            snprintf(msg, sizeof(msg), "Image written to:\n%s", j->target);
         }
         else if(!cancelled)
-            bk_error("Writing", j->target, j->rc);
+        {
+            title = APP_NAME " - Error";
+            snprintf(msg, sizeof(msg), "Writing %s failed:\n%s",
+                     j->target, bk_get_error_string(j->rc));
+        }
         break;
     }
 
     if(j->log && j->loglen)
     {
+        size_t used = strlen(msg);
+
         if(j->loglen > MSG_MAX - 80)
             strcpy(j->log + MSG_MAX - 84, "\n...");
-        dw_messagebox(APP_NAME, DW_MB_OK | DW_MB_WARNING, "%d item(s) had problems:\n\n%s",
-                      j->failures ? j->failures : 1, j->log);
+        if(strcmp(title, APP_NAME) == 0)
+            title = APP_NAME " - Warning";
+        snprintf(msg + used, sizeof(msg) - used, "%s%d item(s) had problems:\n\n%s",
+                 used ? "\n\n" : "", j->failures ? j->failures : 1, j->log);
     }
+    if(*msg)
+        notice_show(title, "%s", msg);
+
     job_free(j);
-}
-
-static int DWSIGNAL job_timer_cb(void *data)
-{
-    Job *j = g_job;
-    char buf[400];
-
-    if(!j)
-        return TRUE;
-
-    if(j->done)
-    {
-        /* On GTK the timer return value is ignored, so disconnect explicitly */
-        dw_timer_disconnect(g_jobtimer);
-        g_jobtimer = 0;
-        job_finish();
-        return FALSE;
-    }
-
-    if(g_cancel)
-        return TRUE;
-
-    switch(j->type)
-    {
-    case JOB_OPEN:
-        snprintf(buf, sizeof(buf), "Reading %s", base_name(j->target));
-        break;
-    case JOB_ADD:
-        snprintf(buf, sizeof(buf), "Adding %d of %d: %s", j->current + 1, j->count,
-                 base_name(j->items[j->current]));
-        break;
-    case JOB_EXTRACT:
-        snprintf(buf, sizeof(buf), "Extracting %d of %d: %s", j->current + 1, j->count,
-                 base_name(j->items[j->current]));
-        break;
-    default:
-        snprintf(buf, sizeof(buf), "Writing %s (%d%%)", base_name(j->target), (int)g_percent);
-        dw_percent_set_pos(g_progbar, (unsigned int)g_percent);
-        break;
-    }
-    dw_window_set_text(g_progtext, buf);
-    return TRUE;
+    g_job = NULL;
+    dw_window_enable(g_mainwin);
 }
 
 /* Takes ownership of items and target. */
@@ -1063,17 +1131,20 @@ static void job_start(int type, char **items, int count, char *target)
     j->count = count;
     j->target = target;
     g_cancel = 0;
-    g_percent = 0;
+    g_lastpct = -1;
     g_job = j;
 
     dw_window_disable(g_mainwin);
     dw_window_set_text(g_progwin, titles[type]);
-    dw_window_set_text(g_progtext, "Starting...");
+    if(type == JOB_OPEN)
+        dw_window_set_text(g_progtext, "Reading image...");
+    else if(type == JOB_SAVE)
+        dw_window_set_text(g_progtext, "Writing image...");
+    else
+        dw_window_set_text(g_progtext, "Starting...");
     dw_percent_set_pos(g_progbar, 0);
-    if(type != JOB_SAVE)
-        dw_percent_set_pos(g_progbar, DW_PERCENT_INDETERMINATE);
     dw_window_show(g_progwin);
-    g_jobtimer = dw_timer_connect(JOB_POLL_MS, DW_SIGNAL_FUNC(job_timer_cb), NULL);
+    /* Last GUI access on this thread for the job; the worker owns it now */
     dw_thread_new(DW_SIGNAL_FUNC(job_thread), j, WORKER_STACK);
 }
 
@@ -1944,6 +2015,7 @@ int dwmain(int argc, char *argv[])
 
     mainwindow_create();
     progress_window_create();
+    notice_create();
     local_refresh();
     iso_refresh();
 
@@ -1963,6 +2035,7 @@ int dwmain(int argc, char *argv[])
     dw_main();
 
     /* Main loop has ended, so no pending GTK timeouts can fire any more */
+    dw_window_destroy(g_notewin);
     dw_window_destroy(g_progwin);
     dw_window_destroy(g_mainwin);
     bk_destroy_vol_info(g_vol);
