@@ -25,10 +25,10 @@ BKLIB  = $(BKDIR)/bk.a
 
 .PHONY: all clean
 
-all: isoedit$(EXEEXT)
+all: dwisoedit$(EXEEXT)
 
-isoedit$(EXEEXT): isoedit.c $(BKLIB)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ isoedit.c $(BKLIB) $(LDLIBS)
+dwisoedit$(EXEEXT): dwisoedit.c $(BKLIB)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ dwisoedit.c $(BKLIB) $(LDLIBS)
 
 # Builds bk.a directly so this does not depend on the bkisofs Makefile
 $(BKLIB): $(addprefix $(BKDIR)/,$(BKOBJS:.o=.c))
@@ -37,4 +37,4 @@ $(BKLIB): $(addprefix $(BKDIR)/,$(BKOBJS:.o=.c))
 	done && $(AR) -cr bk.a $(BKOBJS)
 
 clean:
-	rm -f isoedit isoedit.exe
+	rm -f dwisoedit dwisoedit.exe
