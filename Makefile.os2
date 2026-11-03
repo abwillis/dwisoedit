@@ -1,0 +1,91 @@
+#
+# Makefile for DWISOEdit on OS/2
+#
+# Dynamic Windows is expected to be installed in the normal OS/2
+# include and library search paths.
+#
+# bkisofs is expected in ../bkisofs by default. Override with:
+#
+#   make BKDIR=d:/path/to/bkisofs
+#
+
+CC      = gcc
+AR      = emxomfar
+RM      = rm -f
+
+BKDIR   ?= ../bkisofs
+
+TARGET  = dwisoedit.exe
+DEF     = dwisoedit.def
+
+#
+# bkisofs and DWISOEdit must agree on the size of off_t.
+#
+CPPFLAGS = -D_FILE_OFFSET_BITS=64 -D__OS2__ -I$(BKDIR)
+
+CFLAGS = -O2 -Wall -Wextra -std=gnu99
+
+#
+# -Zomf is required for native OS/2 OMF objects/libraries.
+#
+LDFLAGS = -Zomf -Zmap
+
+#
+# Dynamic Windows is installed in the standard library path, so no -L
+# option is required.
+#
+LDLIBS = -ldw -lpthread
+
+BKOBJS = \
+	bkRead7x.o \
+	bkAdd.o \
+	bkDelete.o \
+	bkExtract.o \
+	bkRead.o \
+	bkPath.o \
+	bkMangle.o \
+	bkWrite.o \
+	bkWrite7x.o \
+	bkTime.o \
+	bkSort.o \
+	bkError.o \
+	bkGet.o \
+	bkSet.o \
+	bkCache.o \
+	bkLink.o \
+	bkMisc.o \
+	bkIoWrappers.o
+
+BKLIB = $(BKDIR)/bk.a
+
+.PHONY: all clean clean-bkisofs
+
+all: $(TARGET)
+
+$(TARGET): isoedit.o $(BKLIB) $(DEF)
+	$(CC) $(LDFLAGS) -o $@ isoedit.o $(BKLIB) $(DEF) $(LDLIBS)
+
+isoedit.o: isoedit.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c isoedit.c -o isoedit.o
+
+#
+# Build the static bkisofs library directly. This avoids depending on
+# the bkisofs Makefile and guarantees that bkisofs is built with the
+# same _FILE_OFFSET_BITS setting as DWISOEdit.
+#
+$(BKLIB): $(addprefix $(BKDIR)/,$(BKOBJS:.o=.c))
+	cd $(BKDIR) && \
+	for f in $(BKOBJS:.o=); do \
+		$(CC) -Zomf -D_FILE_OFFSET_BITS=64 -D__OS2__ \
+			-O2 -Wall -std=gnu99 \
+			-c $$f.c -o $$f.o || exit 1; \
+	done && \
+	$(AR) r bk.a $(BKOBJS)
+
+clean:
+	$(RM) isoedit.o
+	$(RM) $(TARGET)
+	$(RM) dwisoedit.map
+
+clean-bkisofs:
+	cd $(BKDIR) && $(RM) $(BKOBJS) bk.a

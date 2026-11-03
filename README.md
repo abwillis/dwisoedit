@@ -75,7 +75,7 @@ as `C:/` are recognized for Windows and OS/2 builds.
 
 ```bash
 git clone <this-repository>
-cd isoedit
+cd dwisoedit
 make BKDIR=/path/to/bkisofs
 ```
 
@@ -101,7 +101,7 @@ make BKDIR=/path/to/bkisofs CC="gcc -g -O0"
   `-D_FILE_OFFSET_BITS=64`, and its `VolInfo` structure contains `off_t`
   fields. The application must use the same setting, or the two sides will
   disagree about the structure layout. The Makefile sets it, and
-  `isoedit.c` also forces it as a fallback.
+  `dwisoedit.c` also forces it as a fallback.
 - **The bkisofs Makefile is not used.** The Makefile here compiles `bk.a`
   straight from the bkisofs `.c` files, so a bkisofs Makefile whose recipe
   lines lost their tab characters (`missing separator`) does not block the
@@ -112,8 +112,8 @@ make BKDIR=/path/to/bkisofs CC="gcc -g -O0"
 ## Usage
 
 ```bash
-./isoedit                    # start with a new, empty image
-./isoedit /path/to/image.iso # open an image at startup
+./dwisoedit                    # start with a new, empty image
+./dwisoedit /path/to/image.iso # open an image at startup
 ```
 
 | Action | How |
@@ -187,7 +187,7 @@ Starting it under gdb avoids the `ptrace_scope` restriction that blocks
 attaching to an already-running process.
 
 ```bash
-gdb -ex "set pagination off" -ex run --args ./isoedit
+gdb -ex "set pagination off" -ex run --args ./dwisoedit
 # reproduce the problem, press Ctrl+C in the gdb terminal, then:
 thread apply all bt
 ```
@@ -199,7 +199,7 @@ backend in use and its version, and the steps to reproduce.
 
 ### ISO Editor
 
-The ISO Editor source code in this repository (`isoedit.c`, `Makefile` and
+The ISO Editor source code in this repository (`dwisoedit.c`, `Makefile` and
 documentation) is released under the **BSD 3-Clause License**.
 
     Copyright (c) 2026, abwillis
@@ -260,7 +260,7 @@ See `license.txt` in the Dynamic Windows source tree for the full text.
 ### Distributing compiled binaries
 
 This repository contains source code only, so the BSD 3-Clause License above
-is the only license that applies to its contents. A compiled `isoedit`
+is the only license that applies to its contents. A compiled `dwisoedit`
 binary is potentially different:
 
 - **It is a combined work under GPLv2.** The binary statically links bkisofs
