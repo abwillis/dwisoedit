@@ -1,91 +1,56 @@
 #
 # Makefile for DWISOEdit on OS/2
 #
-# Dynamic Windows is expected to be installed in the normal OS/2
-# include and library search paths.
+# Prerequisites expected in the standard include/library paths:
 #
-# bkisofs is expected in ../bkisofs by default. Override with:
+#   Dynamic Windows:
+#       dw.h
+#       dw.lib
 #
-#   make BKDIR=d:/path/to/bkisofs
+#   bkisofs:
+#       bk.h
+#       bk.a
+#
+# The executable must be linked as an OS/2 Presentation Manager
+# application using dwisoedit.def.
 #
 
 CC      = gcc
-AR      = emxomfar
 RM      = rm -f
 
-BKDIR   ?= ../bkisofs
-
 TARGET  = dwisoedit.exe
+OBJECTS = dwisoedit.o
 DEF     = dwisoedit.def
 
 #
-# bkisofs and DWISOEdit must agree on the size of off_t.
+# bkisofs uses 64-bit off_t. ISO Editor must be compiled with the
+# same setting because VolInfo contains off_t fields.
 #
-CPPFLAGS = -D_FILE_OFFSET_BITS=64 -D__OS2__ -I$(BKDIR)
+CPPFLAGS = -D_FILE_OFFSET_BITS=64 -D__OS2__
 
 CFLAGS = -O2 -Wall -Wextra -std=gnu99
 
 #
-# -Zomf is required for native OS/2 OMF objects/libraries.
+# Generate native OS/2 OMF output and a linker map.
 #
 LDFLAGS = -Zomf -Zmap
 
 #
-# Dynamic Windows is installed in the standard library path, so no -L
-# option is required.
+# Both libraries are in the normal OS/2 library path.
 #
-LDLIBS = -ldw -lpthread
+LDLIBS = -lbk -ldw -lpthread
 
-BKOBJS = \
-	bkRead7x.o \
-	bkAdd.o \
-	bkDelete.o \
-	bkExtract.o \
-	bkRead.o \
-	bkPath.o \
-	bkMangle.o \
-	bkWrite.o \
-	bkWrite7x.o \
-	bkTime.o \
-	bkSort.o \
-	bkError.o \
-	bkGet.o \
-	bkSet.o \
-	bkCache.o \
-	bkLink.o \
-	bkMisc.o \
-	bkIoWrappers.o
-
-BKLIB = $(BKDIR)/bk.a
-
-.PHONY: all clean clean-bkisofs
+.PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): isoedit.o $(BKLIB) $(DEF)
-	$(CC) $(LDFLAGS) -o $@ isoedit.o $(BKLIB) $(DEF) $(LDLIBS)
+$(TARGET): $(OBJECTS) $(DEF)
+	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(DEF) $(LDLIBS)
 
-isoedit.o: isoedit.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c isoedit.c -o isoedit.o
-
-#
-# Build the static bkisofs library directly. This avoids depending on
-# the bkisofs Makefile and guarantees that bkisofs is built with the
-# same _FILE_OFFSET_BITS setting as DWISOEdit.
-#
-$(BKLIB): $(addprefix $(BKDIR)/,$(BKOBJS:.o=.c))
-	cd $(BKDIR) && \
-	for f in $(BKOBJS:.o=); do \
-		$(CC) -Zomf -D_FILE_OFFSET_BITS=64 -D__OS2__ \
-			-O2 -Wall -std=gnu99 \
-			-c $$f.c -o $$f.o || exit 1; \
-	done && \
-	$(AR) r bk.a $(BKOBJS)
+isoedit.o: dwisoedit.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c dwisoedit.c -o dwisoedit.o
 
 clean:
-	$(RM) isoedit.o
+	$(RM) $(OBJECTS)
 	$(RM) $(TARGET)
 	$(RM) dwisoedit.map
-
-clean-bkisofs:
-	cd $(BKDIR) && $(RM) $(BKOBJS) bk.a
